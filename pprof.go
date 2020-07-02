@@ -1,172 +1,205 @@
 package pprof
 
 import (
-	"errors"
-	"fmt"
-	"net/http"
+	"log"
 	_ "net/http/pprof"
 	"os"
-	"os/exec"
-	"path/filepath"
+	"path"
 	"runtime"
-	"runtime/debug"
 	"runtime/pprof"
 	"runtime/trace"
-	"strings"
+
+	"github.com/buaazp/fasthttprouter"
+	"github.com/json-iterator/go"
+	"github.com/kataras/iris/httptest"
+	"github.com/valyala/fasthttp"
 )
 
-var path string = ""
+const (
+	serviceName = "pprof"
+)
+
+var (
+	dirFullPath string
+	router      *fasthttprouter.Router = nil
+	fCpu        *os.File               = nil
+	fMem        *os.File               = nil
+	fTrace      *os.File               = nil
+	fBlock      *os.File               = nil
+)
+
+type msgResp struct {
+	Cpu   string `json:"cpu"`
+	Mem   string `json:"mem"`
+	Trace string `json:"trace"`
+	Block string `json:"block,omitempty"`
+}
+
+func init() {
+	curPath, err := os.Getwd()
+	if err != nil {
+		log.Panic(err)
+	}
+
+	dirFullPath = path.Join(curPath, "pprof")
+	if !isExists(dirFullPath) {
+		if err := os.Mkdir(dirFullPath, 0666); err != nil {
+			log.Panic(err)
+		}
+	}
+
+	router = fasthttprouter.New()
+	router.POST("/start", handleStart)
+	router.GET("/start", handleStart)
+	router.POST("/stop", handleStop)
+	router.GET("/stop", handleStop)
+	router.POST("/gc", handleGC)
+	router.GET("/gc", handleGC)
+}
 
 func Pprof() {
 	go func() {
-		curPath, err := getCurrentPath()
-		if err != nil {
-			fmt.Printf("获取本地路径失败\n")
-			return
+		ser := &fasthttp.Server{
+			Name:    serviceName,
+			Handler: router.Handler,
 		}
-		//创建文件夹
-		path = curPath + "/tmp"
-		if !isExists(path) {
-			//	创建
-			if err := os.Mkdir(path, 0666); err != nil {
-				fmt.Printf("创建文件夹tmp失败\n")
-				return
-			}
+		if err := ser.ListenAndServe(":6060"); err != nil {
+			log.Panic(err)
 		}
-
-		//默认是关闭GC的
-		debug.SetGCPercent(100)
-		http.HandleFunc("/start", start)
-		http.HandleFunc("/stop", stop)
-		http.HandleFunc("/gc", gc)
-		http.ListenAndServe(":6060", nil)
 	}()
 }
-
-func start(w http.ResponseWriter, r *http.Request) {
-	if err := startTrace(); err != nil {
-		fmt.Println("启动trace pprof失败")
-		w.Write([]byte("启动trace pprof失败"))
-	}
-	if err := startCPU(); err != nil {
-		fmt.Println("启动cpu pprof失败")
-		w.Write([]byte("启动cpu pprof失败"))
-	}
-
-	if err := saveMem(); err != nil {
-		fmt.Println("存储mem pprof失败")
-		w.Write([]byte("存储mem pprof失败"))
-	}
-	if err := saveBlock(); err != nil {
-		fmt.Println("存储groutine block pprof失败")
-		w.Write([]byte("存储groutine pprof失败"))
-	}
-	fmt.Println("启动cpu pprof，存储mem pprof，存储groutine pprof成功")
-	w.Write([]byte("启动trace pprof， cpu pprof，存储mem pprof，存储groutine pprof成功"))
-}
-
-func stop(w http.ResponseWriter, r *http.Request) {
-	stopCpuProf()
-	stopTrace()
-	fmt.Println("停止trace pprof，cpu pprof成功")
-	w.Write([]byte("停止trace pprof，cpu pprof成功"))
-}
-
-var fCPU *os.File = nil
-var fTrace *os.File = nil
-
-func startCPU() error {
-	var err error
-	fCPU, err = os.Create(path + "/cpu.prof")
+func generateFile(filepath string) (*os.File, error) {
+	f, err := os.Create(filepath)
 	if err != nil {
-		fmt.Println("创建cpu的pprof文件失败，错误:%v", err)
-		fCPU.Close()
-		return err
+		return &os.File{}, nil
 	}
-	if err := pprof.StartCPUProfile(fCPU); err != nil {
-		fmt.Println("写入cpuPprof文件存储失败，错误：%v", err)
-		fCPU.Close()
-	}
-	return nil
+	return f, nil
 }
 
-func stopCpuProf() {
-	pprof.StopCPUProfile()
-	fCPU.Close()
-}
-
-func startTrace() error {
+func handleStart(ctx *fasthttp.RequestCtx) {
+	log.Printf("recv profile start.")
+	filepaths := []string{path.Join(dirFullPath, "cpu.pprof"), path.Join(dirFullPath, "mem.pprof"), path.Join(dirFullPath, "trace.pprof"), path.Join(dirFullPath, "block.pprof")}
+	deleteFile(filepaths)
 	var err error
-	fTrace, err = os.Create(path + "/trace.out")
+	fCpu, err = generateFile(filepaths[0])
 	if err != nil {
-		fmt.Println("创建trace pprof文件失败，错误：", err)
-		return err
+		log.Printf("generate cpu.pprof failed. %v")
+		respErr(ctx, &msgResp{
+			Cpu: "generate cpu.pprof failed.",
+		})
+		return
+	}
+	if err := pprof.StartCPUProfile(fCpu); err != nil {
+		log.Printf("start cpu profile failed.%v", err)
+		respErr(ctx, &msgResp{
+			Cpu: "start cpu profile failed.",
+		})
+		return
 	}
 
-	if err = trace.Start(fTrace); err != nil {
-		fmt.Println("启动trace pprof文件失败，错误：", err)
-		return err
+	fMem, err = generateFile(filepaths[1])
+	if err != nil {
+		log.Printf("generate mem.pprof failed. %v")
+		respErr(ctx, &msgResp{
+			Mem: "generate mem.pprof failed.",
+		})
+		return
 	}
-	return nil
+	if err := pprof.WriteHeapProfile(fMem); err != nil {
+		log.Printf("start mem profile failed.%v", err)
+		respErr(ctx, &msgResp{
+			Mem: "start mem profile failed.",
+		})
+		return
+	}
+
+	fTrace, err = generateFile(filepaths[2])
+	if err != nil {
+		log.Printf("generate trace.pprof failed. %v")
+		respErr(ctx, &msgResp{
+			Trace: "generate mem.pprof failed.",
+		})
+		return
+	}
+	if err := trace.Start(fTrace); err != nil {
+		log.Printf("start trace profile failed.%v", err)
+		respErr(ctx, &msgResp{
+			Trace: "start trace profile failed.",
+		})
+		return
+	}
+
+	fBlock, err = generateFile(filepaths[3])
+	if err != nil {
+		log.Printf("generate block.pprof failed. %v")
+		respErr(ctx, &msgResp{
+			Block: "generate block.pprof failed.",
+		})
+		return
+	}
+	if err := pprof.Lookup("block").WriteTo(fBlock, 0); err != nil {
+		log.Printf("start block profile failed.%v", err)
+		respErr(ctx, &msgResp{
+			Block: "start block profile failed.",
+		})
+		return
+	}
+
+	respSucc(ctx, &msgResp{
+		Cpu:   "cpu profile start success",
+		Mem:   "mem profile start success",
+		Trace: "trace profile start success",
+		Block: "block profile start success",
+	})
 }
 
-func stopTrace() {
-	trace.Stop()
-	fTrace.Close()
+func handleStop(ctx *fasthttp.RequestCtx) {
+	log.Printf("recv profile stop.")
+	if fCpu != nil {
+		pprof.StopCPUProfile()
+		fCpu.Close()
+	}
+
+	// 内存不需要停止
+	fMem.Close()
+	if fTrace != nil {
+		trace.Stop()
+		fTrace.Close()
+	}
+	// block直接关闭
+	fBlock.Close()
+
+	respSucc(ctx, &msgResp{
+		Cpu:   "cpu profile stop success",
+		Mem:   "mem profile stop success",
+		Trace: "trace profile stop success",
+		Block: "block profile stop success",
+	})
 }
 
-func gc(w http.ResponseWriter, r *http.Request) {
+func handleGC(ctx *fasthttp.RequestCtx) {
 	runtime.GC()
-	w.Write([]byte("启动GC"))
 }
 
-func saveMem() error {
-	f, err := os.Create(path + "/mem.prof")
-	if err != nil {
-		fmt.Println("创建mem的pprof文件失败，错误:%v", err)
-		return err
-	}
-
-	if err := pprof.WriteHeapProfile(f); err != nil {
-		fmt.Println("写入memPprof文件存储失败，错误：%v", err)
-	}
-	f.Close()
-	return nil
+func respErr(ctx *fasthttp.RequestCtx, msg *msgResp) {
+	ctx.Response.SetStatusCode(httptest.StatusInternalServerError)
+	msgStr, _ := jsoniter.MarshalToString(msg)
+	ctx.Response.SetBodyString(msgStr)
 }
 
-func saveBlock() error {
-	f, err := os.Create(path + "/block.prof")
-	if err != nil {
-		fmt.Println("创建block文件存储失败，错误：%v", err)
-		return err
-	}
-
-	if err := pprof.Lookup("block").WriteTo(f, 0); err != nil {
-		fmt.Println("写入block的pprofPprof文件失败，错误：%v", err)
-	}
-	f.Close()
-	return nil
+func respSucc(ctx *fasthttp.RequestCtx, msg *msgResp) {
+	ctx.Response.SetStatusCode(httptest.StatusInternalServerError)
+	msgStr, _ := jsoniter.MarshalToString(msg)
+	ctx.Response.SetBodyString(msgStr)
 }
 
-func getCurrentPath() (string, error) {
-	file, err := exec.LookPath(os.Args[0])
-	if err != nil {
-		return "", err
-	}
-	path, err := filepath.Abs(file)
-	if err != nil {
-		return "", err
-	}
-	i := strings.LastIndex(path, "/")
-	if i < 0 {
-		i = strings.LastIndex(path, "\\")
-	}
-	if i < 0 {
-		return "", errors.New(`error: Can't find "/" or "\".`)
-	}
-	return string(path[0 : i+1]), nil
-}
-
+/**
+ * @Author      : Administrator
+ * @Description : 判断目录是否存在
+ * @Date        : 2020/7/2 0002 15:50
+ * @Param       :
+ * @return      : 存在：true；不存在：false
+ **/
 func isExists(path string) bool {
 	_, err := os.Stat(path)
 	if err != nil {
@@ -176,4 +209,15 @@ func isExists(path string) bool {
 		return false
 	}
 	return true
+}
+
+func deleteFile(filepaths []string) {
+	for _, filepath := range filepaths {
+		if isExists(filepath) {
+
+			if err := os.Remove(filepath); err != nil {
+				log.Printf("delete %v failed.%v", filepath, err)
+			}
+		}
+	}
 }
