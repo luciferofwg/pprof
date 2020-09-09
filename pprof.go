@@ -1,31 +1,38 @@
 package pprof
 
 import (
+	"context"
+	"encoding/json"
+	"fmt"
 	"log"
+	"net/http"
 	_ "net/http/pprof"
 	"os"
 	"path"
-	"runtime"
+	"runtime/debug"
 	"runtime/pprof"
 	"runtime/trace"
+	"time"
+)
 
-	"github.com/buaazp/fasthttprouter"
-	"github.com/json-iterator/go"
-	"github.com/kataras/iris/httptest"
-	"github.com/valyala/fasthttp"
+type gcSwitch string
+
+var (
+	_gcSwitch   gcSwitch = gcOff
+	srv         *http.Server
+	dirFullPath string
+	fCpu        *os.File = nil
+	fMem        *os.File = nil
+	fTrace      *os.File = nil
+	fBlock      *os.File = nil
 )
 
 const (
-	serviceName = "pprof"
-)
-
-var (
-	dirFullPath string
-	router      *fasthttprouter.Router = nil
-	fCpu        *os.File               = nil
-	fMem        *os.File               = nil
-	fTrace      *os.File               = nil
-	fBlock      *os.File               = nil
+	gcOff             = "gcOff"
+	gcOn              = "gcOn"
+	uriStartWithoutGC = "/startnogc"
+	uriStartWithGC    = "/start"
+	uriStop           = "/start"
 )
 
 type msgResp struct {
@@ -47,27 +54,37 @@ func init() {
 			log.Panic(err)
 		}
 	}
-
-	router = fasthttprouter.New()
-	router.POST("/start", handleStart)
-	router.GET("/start", handleStart)
-	router.POST("/stop", handleStop)
-	router.GET("/stop", handleStop)
-	router.POST("/gc", handleGC)
-	router.GET("/gc", handleGC)
 }
 
-func Pprof() {
-	go func() {
-		ser := &fasthttp.Server{
-			Name:    serviceName,
-			Handler: router.Handler,
-		}
-		if err := ser.ListenAndServe(":6060"); err != nil {
+func Pprof(port int) {
+	addrs := fmt.Sprintf("localhost:%d", port)
+	log.Printf("pprof listen addr=[%v]", addrs)
+
+	http.HandleFunc(uriStartWithoutGC, handleStart)
+	http.HandleFunc(uriStartWithGC, handleStart)
+	http.HandleFunc(uriStop, handleStop)
+
+	srv = &http.Server{
+		Addr:    addrs,
+		Handler: nil,
+	}
+	go func(addr string) {
+		if err := srv.ListenAndServe(); err != nil {
 			log.Panic(err)
 		}
-	}()
+	}(addrs)
 }
+
+func Shutdown() error {
+	ctx, cancle := context.WithTimeout(context.Background(), time.Duration(1))
+	defer cancle()
+	if err := srv.Shutdown(ctx); err != nil {
+		log.Printf("stop srv failed,%v", err)
+		return err
+	}
+	return nil
+}
+
 func generateFile(filepath string) (*os.File, error) {
 	f, err := os.Create(filepath)
 	if err != nil {
@@ -76,22 +93,32 @@ func generateFile(filepath string) (*os.File, error) {
 	return f, nil
 }
 
-func handleStart(ctx *fasthttp.RequestCtx) {
+func handleStart(w http.ResponseWriter, r *http.Request) {
+	switch r.URL.String() {
+	case uriStartWithoutGC:
+		_gcSwitch = gcOff
+		debug.SetGCPercent(-1)
+	case uriStartWithGC:
+		_gcSwitch = gcOff
+		debug.SetGCPercent(100)
+	}
+
 	log.Printf("recv profile start.")
+
 	filepaths := []string{path.Join(dirFullPath, "cpu.pprof"), path.Join(dirFullPath, "mem.pprof"), path.Join(dirFullPath, "trace.pprof"), path.Join(dirFullPath, "block.pprof")}
 	deleteFile(filepaths)
 	var err error
 	fCpu, err = generateFile(filepaths[0])
 	if err != nil {
 		log.Printf("generate cpu.pprof failed. %v")
-		respErr(ctx, &msgResp{
+		respErr(w, &msgResp{
 			Cpu: "generate cpu.pprof failed.",
 		})
 		return
 	}
 	if err := pprof.StartCPUProfile(fCpu); err != nil {
 		log.Printf("start cpu profile failed.%v", err)
-		respErr(ctx, &msgResp{
+		respErr(w, &msgResp{
 			Cpu: "start cpu profile failed.",
 		})
 		return
@@ -100,14 +127,14 @@ func handleStart(ctx *fasthttp.RequestCtx) {
 	fMem, err = generateFile(filepaths[1])
 	if err != nil {
 		log.Printf("generate mem.pprof failed. %v")
-		respErr(ctx, &msgResp{
+		respErr(w, &msgResp{
 			Mem: "generate mem.pprof failed.",
 		})
 		return
 	}
 	if err := pprof.WriteHeapProfile(fMem); err != nil {
 		log.Printf("start mem profile failed.%v", err)
-		respErr(ctx, &msgResp{
+		respErr(w, &msgResp{
 			Mem: "start mem profile failed.",
 		})
 		return
@@ -116,14 +143,14 @@ func handleStart(ctx *fasthttp.RequestCtx) {
 	fTrace, err = generateFile(filepaths[2])
 	if err != nil {
 		log.Printf("generate trace.pprof failed. %v")
-		respErr(ctx, &msgResp{
+		respErr(w, &msgResp{
 			Trace: "generate mem.pprof failed.",
 		})
 		return
 	}
 	if err := trace.Start(fTrace); err != nil {
 		log.Printf("start trace profile failed.%v", err)
-		respErr(ctx, &msgResp{
+		respErr(w, &msgResp{
 			Trace: "start trace profile failed.",
 		})
 		return
@@ -132,20 +159,20 @@ func handleStart(ctx *fasthttp.RequestCtx) {
 	fBlock, err = generateFile(filepaths[3])
 	if err != nil {
 		log.Printf("generate block.pprof failed. %v")
-		respErr(ctx, &msgResp{
+		respErr(w, &msgResp{
 			Block: "generate block.pprof failed.",
 		})
 		return
 	}
 	if err := pprof.Lookup("block").WriteTo(fBlock, 0); err != nil {
 		log.Printf("start block profile failed.%v", err)
-		respErr(ctx, &msgResp{
+		respErr(w, &msgResp{
 			Block: "start block profile failed.",
 		})
 		return
 	}
 
-	respSucc(ctx, &msgResp{
+	respSucc(w, &msgResp{
 		Cpu:   "cpu profile start success",
 		Mem:   "mem profile start success",
 		Trace: "trace profile start success",
@@ -153,8 +180,13 @@ func handleStart(ctx *fasthttp.RequestCtx) {
 	})
 }
 
-func handleStop(ctx *fasthttp.RequestCtx) {
+func handleStop(w http.ResponseWriter, r *http.Request) {
 	log.Printf("recv profile stop.")
+	if _gcSwitch == gcOn {
+		_gcSwitch = gcOff
+		debug.SetGCPercent(100)
+	}
+
 	if fCpu != nil {
 		pprof.StopCPUProfile()
 		fCpu.Close()
@@ -169,7 +201,7 @@ func handleStop(ctx *fasthttp.RequestCtx) {
 	// block直接关闭
 	fBlock.Close()
 
-	respSucc(ctx, &msgResp{
+	respSucc(w, &msgResp{
 		Cpu:   "cpu profile stop success",
 		Mem:   "mem profile stop success",
 		Trace: "trace profile stop success",
@@ -177,29 +209,22 @@ func handleStop(ctx *fasthttp.RequestCtx) {
 	})
 }
 
-func handleGC(ctx *fasthttp.RequestCtx) {
-	runtime.GC()
+func respErr(w http.ResponseWriter, msg *msgResp) {
+	w.WriteHeader(http.StatusInternalServerError)
+	valMsg, _ := json.Marshal(msg)
+	if _, err := w.Write(valMsg); err != nil {
+		log.Printf("write err resp msg failed,%v", err)
+	}
 }
 
-func respErr(ctx *fasthttp.RequestCtx, msg *msgResp) {
-	ctx.Response.SetStatusCode(httptest.StatusInternalServerError)
-	msgStr, _ := jsoniter.MarshalToString(msg)
-	ctx.Response.SetBodyString(msgStr)
+func respSucc(w http.ResponseWriter, msg *msgResp) {
+	w.WriteHeader(http.StatusOK)
+	valMsg, _ := json.Marshal(msg)
+	if _, err := w.Write(valMsg); err != nil {
+		log.Printf("write success resp msg failed,%v", err)
+	}
 }
 
-func respSucc(ctx *fasthttp.RequestCtx, msg *msgResp) {
-	ctx.Response.SetStatusCode(httptest.StatusInternalServerError)
-	msgStr, _ := jsoniter.MarshalToString(msg)
-	ctx.Response.SetBodyString(msgStr)
-}
-
-/**
- * @Author      : Administrator
- * @Description : 判断目录是否存在
- * @Date        : 2020/7/2 0002 15:50
- * @Param       :
- * @return      : 存在：true；不存在：false
- **/
 func isExists(path string) bool {
 	_, err := os.Stat(path)
 	if err != nil {
