@@ -32,7 +32,7 @@ const (
 	gcOn              = "gcOn"
 	uriStartWithoutGC = "/startnogc"
 	uriStartWithGC    = "/start"
-	uriStop           = "/start"
+	uriStop           = "/stop"
 )
 
 type msgResp struct {
@@ -60,8 +60,8 @@ func Pprof(port int) {
 	addrs := fmt.Sprintf("localhost:%d", port)
 	log.Printf("pprof listen addr=[%v]", addrs)
 
-	http.HandleFunc(uriStartWithoutGC, handleStartWithoutGC)
-	http.HandleFunc(uriStartWithGC, handleStartWithGC)
+	http.HandleFunc(uriStartWithoutGC, handleStart)
+	http.HandleFunc(uriStartWithGC, handleStart)
 	http.HandleFunc(uriStop, handleStop)
 
 	srv = &http.Server{
@@ -93,17 +93,16 @@ func generateFile(filepath string) (*os.File, error) {
 	return f, nil
 }
 
-func handleStartWithoutGC(w http.ResponseWriter, r *http.Request) {
-	_gcSwitch = gcOff
-	debug.SetGCPercent(-1)
-}
-func handleStartWithGC(w http.ResponseWriter, r *http.Request) {
-	_gcSwitch = gcOff
-	debug.SetGCPercent(100)
-	handleStart(w, r)
-}
-
 func handleStart(w http.ResponseWriter, r *http.Request) {
+	switch r.URL.String() {
+	case uriStartWithoutGC:
+		_gcSwitch = gcOff
+		debug.SetGCPercent(-1)
+	case uriStartWithGC:
+		_gcSwitch = gcOff
+		debug.SetGCPercent(100)
+	}
+
 	log.Printf("recv profile start.")
 
 	filepaths := []string{path.Join(dirFullPath, "cpu.pprof"), path.Join(dirFullPath, "mem.pprof"), path.Join(dirFullPath, "trace.pprof"), path.Join(dirFullPath, "block.pprof")}
